@@ -1,15 +1,32 @@
 import os
 import random
 import re
+import sys
 import tempfile
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from tkinter import filedialog
 
 import customtkinter as ctk
 
 from .config import FFMPEG_BIN, FFPROBE_BIN, VIDEO_EXTENSIONS
 from .helpers import append_textbox, run_command, sanitize_filename
+
+VENV_SITE_PACKAGES = (
+    Path(__file__).resolve().parents[1]
+    / "venv"
+    / "lib"
+    / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    / "site-packages"
+)
+if VENV_SITE_PACKAGES.exists() and str(VENV_SITE_PACKAGES) not in sys.path:
+    sys.path.append(str(VENV_SITE_PACKAGES))
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 TARGET_DURATION_SECONDS = 62.0
 MAX_OUTPUT_DURATION_SECONDS = 80.0
@@ -29,6 +46,7 @@ HIGH_SPEED_UP_FACTOR = 1.35
 FINAL_VIDEO_SATURATION = 1.18
 FINAL_VIDEO_CONTRAST = 1.04
 FINAL_AUDIO_VOLUME = 1.2
+RANDOM_FLIP_RATIO = 0.35
 
 
 @dataclass
@@ -47,6 +65,8 @@ class MergeVideoTab:
         self.parent = parent
         self.source_dir = os.getcwd()
         self.output_dir = os.path.join(os.getcwd(), "merged_videos")
+        self.text_detection_cache = {}
+        self.enable_flip_var = ctk.BooleanVar(value=True)
 
         self._build_ui()
         self.append_log(f"Thu muc nguon mac dinh: {self.source_dir}")
@@ -94,6 +114,17 @@ class MergeVideoTab:
         self.count_entry = ctk.CTkEntry(count_frame, width=120)
         self.count_entry.pack(side="left")
         self.count_entry.insert(0, "5")
+
+        flip_frame = ctk.CTkFrame(self.parent, fg_color="transparent")
+        flip_frame.pack(fill="x", padx=20, pady=6)
+        self.flip_checkbox = ctk.CTkCheckBox(
+            flip_frame,
+            text="Lat canh khong co text",
+            variable=self.enable_flip_var,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.flip_checkbox.pack(anchor="w")
 
         self.merge_button = ctk.CTkButton(self.parent, text="Ghep video", command=self.start_merge, width=220)
         self.merge_button.pack(pady=8)
@@ -250,6 +281,105 @@ class MergeVideoTab:
             return total_duration + clip_duration <= MAX_OUTPUT_DURATION_SECONDS
         return False
 
+    def frame_has_text_like_region(self, frame):
+        if cv2 is None or frame is None:
+            return False
+
+        height, width = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        tophat = cv2.morphologyEx(
+            gray,
+            cv2.MORPH_TOPHAT,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5)),
+        )
+        _, thresh = cv2.threshold(tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        merged = cv2.morphologyEx(
+            thresh,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (17, 3)),
+            iterations=2,
+        )
+        contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        text_boxes = 0
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            area = w * h
+            if area < width * height * 0.002:
+                continue
+            if w < width * 0.12:
+                continue
+            if h < 8 or h > height * 0.18:
+                continue
+            if w / max(h, 1) < 2.2:
+                continue
+            text_boxes += 1
+            if text_boxes >= 2:
+                return True
+
+        return False
+
+    def clip_has_text(self, clip):
+        cached = self.text_detection_cache.get(clip.file_path)
+        if cached is not None:
+            return cached
+
+        if cv2 is None:
+            self.text_detection_cache[clip.file_path] = True
+            return True
+
+        capture = cv2.VideoCapture(clip.file_path)
+        if not capture.isOpened():
+            self.text_detection_cache[clip.file_path] = True
+            return True
+
+        try:
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if frame_count <= 0:
+                self.text_detection_cache[clip.file_path] = True
+                return True
+
+            sample_positions = sorted(
+                {
+                    min(frame_count - 1, max(0, int(frame_count * ratio)))
+                    for ratio in (0.15, 0.35, 0.5, 0.7, 0.85)
+                }
+            )
+            hits = 0
+            for position in sample_positions:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, position)
+                ok, frame = capture.read()
+                if not ok:
+                    continue
+                if self.frame_has_text_like_region(frame):
+                    hits += 1
+                    if hits >= 2:
+                        self.text_detection_cache[clip.file_path] = True
+                        return True
+        finally:
+            capture.release()
+
+        self.text_detection_cache[clip.file_path] = False
+        return False
+
+    def pick_flip_targets(self, clips):
+        if not self.enable_flip_var.get():
+            return set()
+        if not clips or cv2 is None:
+            return set()
+
+        candidates = [clip for clip in clips if not self.clip_has_text(clip)]
+        if not candidates:
+            return set()
+
+        flip_count = max(0, int(round(len(clips) * RANDOM_FLIP_RATIO)))
+        flip_count = min(flip_count, len(candidates))
+        if flip_count <= 0:
+            return set()
+
+        return {clip.file_path for clip in random.sample(candidates, flip_count)}
+
     def score_clip_for_intro(self, clip, position):
         effective_duration = self.get_effective_duration(clip)
         score = clip.view_score
@@ -353,12 +483,19 @@ class MergeVideoTab:
 
         return selected_clips
 
-    def build_processed_clip(self, clip, temp_dir, index):
+    def build_processed_clip(self, clip, temp_dir, index, flip_targets=None):
         speed_factor = self.get_speed_factor(clip)
-        if speed_factor <= 1.0:
+        should_flip = bool(flip_targets and clip.file_path in flip_targets)
+        if speed_factor <= 1.0 and not should_flip:
             return clip.file_path
 
         processed_path = os.path.join(temp_dir, f"clip_{index:03d}.mp4")
+        video_filters = []
+        if should_flip:
+            video_filters.append("hflip")
+        if speed_factor > 1.0:
+            video_filters.append(f"setpts=PTS/{speed_factor}")
+
         result = run_command(
             [
                 FFMPEG_BIN,
@@ -367,7 +504,7 @@ class MergeVideoTab:
                 "-i",
                 clip.file_path,
                 "-filter:v",
-                f"setpts=PTS/{speed_factor}",
+                ",".join(video_filters),
                 "-filter:a",
                 f"atempo={speed_factor}",
                 "-c:v",
@@ -387,10 +524,11 @@ class MergeVideoTab:
             raise RuntimeError(result.stderr.strip() or f"Khong the tang toc canh {index}.")
         return processed_path
 
-    def merge_with_ffmpeg(self, clips, output_path):
+    def merge_with_ffmpeg(self, clips, output_path, flip_targets=None):
         with tempfile.TemporaryDirectory(prefix="merge_clips_") as temp_dir:
+            flip_targets = flip_targets or set()
             prepared_paths = [
-                self.build_processed_clip(clip, temp_dir, index)
+                self.build_processed_clip(clip, temp_dir, index, flip_targets=flip_targets)
                 for index, clip in enumerate(clips, start=1)
             ]
 
@@ -434,13 +572,15 @@ class MergeVideoTab:
                 if os.path.exists(concat_path):
                     os.remove(concat_path)
 
-    def log_selected_clips(self, output_name, clips):
+    def log_selected_clips(self, output_name, clips, flip_targets=None):
         self.append_log(f"Canh duoc chon cho {output_name}:")
+        flip_targets = flip_targets or set()
         for index, clip in enumerate(clips, start=1):
             speed_factor = self.get_speed_factor(clip)
             speed_note = f" | speed {speed_factor:.2f}x" if speed_factor > 1.0 else ""
+            flip_note = " | flip" if clip.file_path in flip_targets else ""
             self.append_log(
-                f"  {index}. {clip.source_key}_{clip.scene_index} | {clip.duration:.1f}s{speed_note}"
+                f"  {index}. {clip.source_key}_{clip.scene_index} | {clip.duration:.1f}s{speed_note}{flip_note}"
             )
 
     def merge_videos(self):
@@ -490,8 +630,9 @@ class MergeVideoTab:
                 output_path = os.path.join(self.output_dir, output_name)
 
                 try:
-                    self.log_selected_clips(output_name, selected_clips)
-                    self.merge_with_ffmpeg(selected_clips, output_path)
+                    flip_targets = self.pick_flip_targets(selected_clips)
+                    self.log_selected_clips(output_name, selected_clips, flip_targets=flip_targets)
+                    self.merge_with_ffmpeg(selected_clips, output_path, flip_targets=flip_targets)
                     created_outputs += 1
                     for clip in selected_clips:
                         global_used.add(clip.file_path)

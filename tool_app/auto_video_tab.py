@@ -77,6 +77,17 @@ class AutoCreateVideoTab:
         self.output_entry.insert(0, self.output_root)
         ctk.CTkButton(output_frame, text="Chon dich", command=self.choose_output_root, width=120).pack(side="left")
 
+        flip_frame = ctk.CTkFrame(self.parent, fg_color="transparent")
+        flip_frame.pack(fill="x", padx=20, pady=6)
+        self.flip_checkbox = ctk.CTkCheckBox(
+            flip_frame,
+            text="Lat canh khong co text",
+            variable=self.merger.enable_flip_var,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.flip_checkbox.pack(anchor="w")
+
         self.create_button = ctk.CTkButton(self.parent, text="Tao video", command=self.start_create, width=220)
         self.create_button.pack(pady=8)
 
@@ -198,8 +209,9 @@ class AutoCreateVideoTab:
             output_name = f"{output_index}.mp4"
             output_path = os.path.join(merge_dir, output_name)
             self.append_log(f"[Merge {output_index}/{output_count}] {output_name}")
-            self.merger.log_selected_clips(output_name, selected_clips)
-            self.merger.merge_with_ffmpeg(selected_clips, output_path)
+            flip_targets = self.merger.pick_flip_targets(selected_clips)
+            self.merger.log_selected_clips(output_name, selected_clips, flip_targets=flip_targets)
+            self.merger.merge_with_ffmpeg(selected_clips, output_path, flip_targets=flip_targets)
             created_outputs += 1
             for clip in selected_clips:
                 global_used.add(clip.file_path)
