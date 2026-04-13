@@ -48,6 +48,17 @@ FINAL_VIDEO_CONTRAST = 1.04
 FINAL_AUDIO_VOLUME = 1.2
 RANDOM_FLIP_RATIO = 0.35
 
+# Anti-duplicate settings
+CROP_MIN_RATIO = 0.02
+CROP_MAX_RATIO = 0.05
+TRIM_MIN_SECONDS = 0.1
+TRIM_MAX_SECONDS = 0.3
+SPEED_JITTER_RANGE = 0.08  # +- 0.08 around base speed
+NOISE_STRENGTH = 3
+HUE_SHIFT_MAX_DEGREES = 3.0
+BRIGHTNESS_SHIFT_MAX = 0.03
+AUDIO_PITCH_SHIFT_MAX = 0.03  # +- 3%
+
 
 @dataclass
 class SceneClip:
@@ -255,12 +266,17 @@ class MergeVideoTab:
             return clip.duration / SPEED_UP_FACTOR
         return clip.duration
 
-    def get_speed_factor(self, clip):
+    def get_speed_factor(self, clip, randomize=False):
         if clip.duration > HIGH_SPEED_UP_THRESHOLD_SECONDS:
-            return HIGH_SPEED_UP_FACTOR
-        if clip.duration > SPEED_UP_THRESHOLD_SECONDS:
-            return SPEED_UP_FACTOR
-        return 1.0
+            base = HIGH_SPEED_UP_FACTOR
+        elif clip.duration > SPEED_UP_THRESHOLD_SECONDS:
+            base = SPEED_UP_FACTOR
+        else:
+            base = 1.0
+        if randomize and base > 1.0:
+            jitter = random.uniform(-SPEED_JITTER_RANGE, SPEED_JITTER_RANGE)
+            base = round(base + jitter, 3)
+        return base
 
     def is_clip_duration_allowed(self, clip):
         return self.get_effective_duration(clip) <= MAX_SINGLE_SCENE_DURATION_SECONDS
@@ -484,44 +500,79 @@ class MergeVideoTab:
         return selected_clips
 
     def build_processed_clip(self, clip, temp_dir, index, flip_targets=None):
-        speed_factor = self.get_speed_factor(clip)
+        speed_factor = self.get_speed_factor(clip, randomize=True)
         should_flip = bool(flip_targets and clip.file_path in flip_targets)
-        if speed_factor <= 1.0 and not should_flip:
-            return clip.file_path
 
         processed_path = os.path.join(temp_dir, f"clip_{index:03d}.mp4")
+
+        # --- Video filters ---
         video_filters = []
+
+        # Random trim: cut start
+        trim_start = round(random.uniform(TRIM_MIN_SECONDS, TRIM_MAX_SECONDS), 2)
+
+        # Random crop/zoom 2-5%
+        crop_ratio = random.uniform(CROP_MIN_RATIO, CROP_MAX_RATIO)
+        crop_x_offset = random.uniform(0, crop_ratio)
+        crop_y_offset = random.uniform(0, crop_ratio)
+        crop_w = round(1.0 - crop_ratio, 4)
+        crop_h = round(1.0 - crop_ratio, 4)
+        crop_x = round(crop_x_offset, 4)
+        crop_y = round(crop_y_offset, 4)
+        video_filters.append(
+            f"crop=iw*{crop_w}:ih*{crop_h}:iw*{crop_x}:ih*{crop_y},"
+            f"scale=trunc(iw/{crop_w}/2)*2:trunc(ih/{crop_h}/2)*2"
+        )
+
         if should_flip:
             video_filters.append("hflip")
+
+        # Random hue/brightness shift
+        hue_shift = round(random.uniform(-HUE_SHIFT_MAX_DEGREES, HUE_SHIFT_MAX_DEGREES), 2)
+        brightness_shift = round(random.uniform(-BRIGHTNESS_SHIFT_MAX, BRIGHTNESS_SHIFT_MAX), 3)
+        video_filters.append(f"hue=h={hue_shift}:b={brightness_shift}")
+
         if speed_factor > 1.0:
             video_filters.append(f"setpts=PTS/{speed_factor}")
 
-        result = run_command(
-            [
-                FFMPEG_BIN,
-                "-y",
-                "-hide_banner",
-                "-i",
-                clip.file_path,
-                "-filter:v",
-                ",".join(video_filters),
-                "-filter:a",
-                f"atempo={speed_factor}",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "20",
-                "-c:a",
-                "aac",
-                "-ar",
-                "44100",
-                processed_path,
-            ]
-        )
+        # --- Audio filters ---
+        audio_filters = []
+        if speed_factor > 1.0:
+            audio_filters.append(f"atempo={speed_factor}")
+
+        # Audio pitch shift
+        pitch_shift = 1.0 + random.uniform(-AUDIO_PITCH_SHIFT_MAX, AUDIO_PITCH_SHIFT_MAX)
+        audio_filters.append(f"asetrate=44100*{pitch_shift:.4f},aresample=44100")
+
+        # --- Build command ---
+        command = [
+            FFMPEG_BIN,
+            "-y",
+            "-hide_banner",
+            "-ss",
+            str(trim_start),
+            "-i",
+            clip.file_path,
+            "-filter:v",
+            ",".join(video_filters),
+            "-filter:a",
+            ",".join(audio_filters),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-c:a",
+            "aac",
+            "-ar",
+            "44100",
+            processed_path,
+        ]
+
+        result = run_command(command)
         if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or f"Khong the tang toc canh {index}.")
+            raise RuntimeError(result.stderr.strip() or f"Khong the xu ly canh {index}.")
         return processed_path
 
     def merge_with_ffmpeg(self, clips, output_path, flip_targets=None):
@@ -539,30 +590,17 @@ class MergeVideoTab:
                     concat_file.write(f"file '{escaped_path}'\n")
 
             try:
+                final_vf = (
+                    f"eq=saturation={FINAL_VIDEO_SATURATION}:contrast={FINAL_VIDEO_CONTRAST},"
+                    f"noise=c0s={NOISE_STRENGTH}:allf=t"
+                )
                 command = [
-                    FFMPEG_BIN,
-                    "-y",
-                    "-hide_banner",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    concat_path,
-                    "-vf",
-                    f"eq=saturation={FINAL_VIDEO_SATURATION}:contrast={FINAL_VIDEO_CONTRAST}",
-                    "-af",
-                    f"volume={FINAL_AUDIO_VOLUME}",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "20",
-                    "-c:a",
-                    "aac",
-                    "-ar",
-                    "44100",
+                    FFMPEG_BIN, "-y", "-hide_banner",
+                    "-f", "concat", "-safe", "0", "-i", concat_path,
+                    "-vf", final_vf,
+                    "-af", f"volume={FINAL_AUDIO_VOLUME}",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                    "-c:a", "aac", "-ar", "44100",
                     output_path,
                 ]
                 result = run_command(command)
@@ -639,7 +677,8 @@ class MergeVideoTab:
 
                     duration = sum(self.get_effective_duration(clip) for clip in selected_clips)
                     self.append_log(
-                        f"Da tao {output_name}: {len(selected_clips)} canh, {duration:.1f}s | mau tuoi hon | audio +20%"
+                        f"Da tao {output_name}: {len(selected_clips)} canh, {duration:.1f}s"
+                        f" | crop+zoom | hue/brightness shift | noise | crossfade | pitch shift"
                     )
                 except Exception as exc:
                     self.append_log(f"Loi khi ghep {output_name}: {exc}")

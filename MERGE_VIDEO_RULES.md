@@ -102,6 +102,39 @@ Vi du:
 
 - Video duoc ghep bang `ffmpeg concat`.
 
+## Rule chong trung lap (anti-duplicate)
+
+Muc tieu: lam moi video output khac biet ve pixel data, audio fingerprint de TikTok khong detect trung voi video goc.
+
+- Random crop/zoom:
+  - crop 2-5% random moi canh, scale lai kich thuoc goc
+  - vi tri crop (x, y) cung random de moi canh khac nhau
+
+- Random trim dau:
+  - cat 0.1s den 0.3s o dau moi canh
+  - thay doi frame dau tien = thay doi thumbnail hash
+
+- Random speed jitter:
+  - thay vi co dinh 1.25x hoac 1.35x, random +- 0.08
+  - vi du: 1.25x co the thanh 1.18x hoac 1.32x
+
+- Random hue/brightness shift:
+  - hue shift +- 3 do moi canh
+  - brightness shift +- 3% moi canh
+  - mat nguoi khong thay nhung pixel data khac hoan toan
+
+- Film noise/grain:
+  - them noise nhe (strength=3) vao output cuoi
+  - pha hash pixel ma khong anh huong chat luong
+
+- Audio pitch shift:
+  - shift pitch +- 3% moi canh
+  - chong audio fingerprint cua TikTok
+
+- Flip canh khong co text:
+  - ~35% canh khong co text duoc lat ngang (hflip)
+  - detect text bang OpenCV truoc khi flip
+
 ## Gia dinh hien tai
 
 - `view` trong ten file la hop le va co the parse duoc thanh so.
