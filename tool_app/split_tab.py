@@ -1,6 +1,10 @@
 import os
 import re
+import shutil
 import threading
+import sys
+import tempfile
+from pathlib import Path
 from tkinter import filedialog
 
 import customtkinter as ctk
@@ -10,12 +14,41 @@ from .config import (
     AUTO_MIN_SEGMENT_DURATION,
     FFMPEG_BIN,
     FFPROBE_BIN,
+    PYSCENE_ADAPTIVE_MIN_CONTENT_VAL,
+    PYSCENE_ADAPTIVE_THRESHOLD,
+    PYSCENE_ADAPTIVE_WINDOW_WIDTH,
+    PYSCENE_MIN_SCENE_LEN_FRAMES,
+    PYSCENE_THRESHOLD,
     SCDET_MIN_SCORE,
     SCDET_NEIGHBOR_WINDOW,
     SCDET_SCORE_PERCENTILE,
+    TRANSNETV2_THRESHOLD,
     VIDEO_EXTENSIONS,
 )
 from .helpers import append_textbox, ensure_unique_filepath, run_command, sanitize_filename
+
+VENV_SITE_PACKAGES = (
+    Path(__file__).resolve().parents[1]
+    / "venv"
+    / "lib"
+    / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    / "site-packages"
+)
+if VENV_SITE_PACKAGES.exists() and str(VENV_SITE_PACKAGES) not in sys.path:
+    sys.path.append(str(VENV_SITE_PACKAGES))
+
+try:
+    from scenedetect import AdaptiveDetector, ContentDetector, detect, split_video_ffmpeg
+except Exception:
+    AdaptiveDetector = None
+    ContentDetector = None
+    detect = None
+    split_video_ffmpeg = None
+
+try:
+    from transnetv2_pytorch import TransNetV2
+except Exception:
+    TransNetV2 = None
 
 
 class SceneSplitTab:
@@ -24,6 +57,7 @@ class SceneSplitTab:
         self.parent = parent
         self.source_dir = os.getcwd()
         self.output_dir = os.getcwd()
+        self._transnet_model = None
 
         self._build_ui()
         self.append_log(f"Thu muc nguon mac dinh: {self.source_dir}")
@@ -39,7 +73,7 @@ class SceneSplitTab:
 
         note = ctk.CTkLabel(
             self.parent,
-            text="Moi video se duoc tu dong nhan dien chuyen canh va cat thanh nhieu file nho, ten giu nguyen va them _1, _2, ...",
+            text="Moi video se duoc tu dong nhan dien chuyen canh va cat thanh nhieu file nho, ten giu nguyen va them _1, _2, ... Hien uu tien AI TransNetV2 de split canh sat hon.",
             wraplength=820,
             justify="left",
         )
@@ -65,7 +99,7 @@ class SceneSplitTab:
         auto_frame.pack(fill="x", padx=20, pady=12)
         ctk.CTkLabel(
             auto_frame,
-            text="Che do tu dong giong CapCut: chi can chon thu muc nguon va thu muc xuat, tool se tu nhan dien cho chuyen canh.",
+            text="Tab nay chi dung AI TransNetV2 de bat shot boundary va split canh. Moi canh qua ngan se duoc gom lai, va moi clip xuat ra se cat 0.25 giay o cuoi.",
             wraplength=820,
             justify="left",
         ).pack(anchor="w", padx=12, pady=12)
@@ -103,6 +137,105 @@ class SceneSplitTab:
             return ffmpeg_ok and ffprobe_ok
         except FileNotFoundError:
             return False
+
+    def has_pyscenedetect(self):
+        return detect is not None and ContentDetector is not None
+
+    def has_pyscenedetect_splitter(self):
+        return self.has_pyscenedetect() and split_video_ffmpeg is not None
+
+    def has_transnetv2(self):
+        return TransNetV2 is not None
+
+    def get_transnet_model(self):
+        if not self.has_transnetv2():
+            raise RuntimeError("Khong tim thay TransNetV2.")
+        if self._transnet_model is None:
+            self._transnet_model = TransNetV2()
+        return self._transnet_model
+
+    def export_ranges(self, file_path, output_dir, ranges, error_message):
+        ranges = self.merge_short_ranges(ranges, AUTO_MIN_SEGMENT_DURATION)
+        stem, ext = os.path.splitext(os.path.basename(file_path))
+        safe_stem = sanitize_filename(stem)
+        created_files = []
+
+        for index, (start, end) in enumerate(ranges, start=1):
+            trimmed_end = max(start, end - AUTO_END_TRIM_SECONDS)
+            if trimmed_end - start < 0.1:
+                continue
+
+            output_name = f"{safe_stem}_{index}{ext}"
+            output_path = ensure_unique_filepath(os.path.join(output_dir, output_name))
+            result = run_command(
+                [
+                    FFMPEG_BIN,
+                    "-y",
+                    "-hide_banner",
+                    "-ss",
+                    f"{start:.3f}",
+                    "-to",
+                    f"{trimmed_end:.3f}",
+                    "-i",
+                    file_path,
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a?",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "18",
+                    "-c:a",
+                    "aac",
+                    output_path,
+                ]
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or error_message.format(index=index))
+            created_files.append(output_path)
+
+        if not created_files:
+            raise RuntimeError("Khong xuat duoc file canh nao.")
+
+        return created_files
+
+    def merge_short_ranges(self, ranges, min_segment_duration):
+        normalized = []
+        for start, end in ranges:
+            start_value = float(start)
+            end_value = float(end)
+            if end_value - start_value > 0:
+                normalized.append((start_value, end_value))
+
+        if not normalized:
+            return []
+
+        merged = normalized[:]
+        index = 0
+        while index < len(merged):
+            start, end = merged[index]
+            if end - start >= min_segment_duration:
+                index += 1
+                continue
+
+            if len(merged) == 1:
+                break
+
+            if index == 0:
+                next_start, next_end = merged[index + 1]
+                merged[index + 1] = (start, next_end)
+                merged.pop(index)
+                continue
+
+            prev_start, prev_end = merged[index - 1]
+            merged[index - 1] = (prev_start, end)
+            merged.pop(index)
+            index -= 1
+
+        return merged
 
     def get_video_duration(self, file_path):
         result = run_command(
@@ -186,7 +319,7 @@ class SceneSplitTab:
             if score < max(local_scores):
                 continue
 
-            if time_value <= 0 or duration - time_value < AUTO_END_TRIM_SECONDS:
+            if time_value <= 0 or duration - time_value <= 0:
                 continue
 
             candidates.append((time_value, score))
@@ -214,7 +347,7 @@ class SceneSplitTab:
     def build_segment_ranges(self, duration, scene_points, min_segment_duration):
         markers = [0.0]
         for point in scene_points:
-            if duration - point < AUTO_END_TRIM_SECONDS:
+            if duration - point <= 0:
                 continue
             if point > markers[-1] + min_segment_duration:
                 markers.append(point)
@@ -230,7 +363,7 @@ class SceneSplitTab:
         for index in range(len(markers) - 1):
             start = markers[index]
             end = markers[index + 1]
-            if end - start >= AUTO_END_TRIM_SECONDS:
+            if end - start > 0:
                 ranges.append((start, end))
 
         if len(ranges) >= 2:
@@ -243,57 +376,130 @@ class SceneSplitTab:
         return ranges
 
     def split_video_by_scenes(self, file_path, output_dir):
-        duration = self.get_video_duration(file_path)
-        scene_points = self.auto_detect_scene_changes(file_path, duration)
-        ranges = self.build_segment_ranges(duration, scene_points, AUTO_MIN_SEGMENT_DURATION)
+        if not self.has_transnetv2():
+            raise RuntimeError("Khong tim thay AI TransNetV2 trong moi truong hien tai.")
+        self.append_log("Dang dung AI TransNetV2...")
+        return self.split_video_by_transnetv2(file_path, output_dir)
+
+    def split_video_by_transnetv2(self, file_path, output_dir):
+        model = self.get_transnet_model()
+        scenes = model.detect_scenes(file_path, threshold=TRANSNETV2_THRESHOLD)
+        if not scenes:
+            raise RuntimeError("TransNetV2 khong tim thay canh nao.")
+
+        ranges = []
+        for scene in scenes:
+            try:
+                start_seconds = float(scene["start_time"])
+                end_seconds = float(scene["end_time"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if end_seconds - start_seconds > 0:
+                ranges.append((start_seconds, end_seconds))
+
         if not ranges:
-            raise RuntimeError("Khong tim thay doan nao de cat.")
+            raise RuntimeError("TransNetV2 tra ve canh nhung khong doc duoc timestamp.")
+
+        self.append_log(f"TransNetV2 tim thay {len(ranges)} canh.")
+        return self.export_ranges(
+            file_path,
+            output_dir,
+            ranges,
+            "Khong cat duoc canh {index} bang TransNetV2.",
+        )
+
+    def split_video_by_adaptive(self, file_path, output_dir):
+        scene_list = detect(
+            file_path,
+            AdaptiveDetector(
+                adaptive_threshold=PYSCENE_ADAPTIVE_THRESHOLD,
+                min_scene_len=PYSCENE_MIN_SCENE_LEN_FRAMES,
+                window_width=PYSCENE_ADAPTIVE_WINDOW_WIDTH,
+                min_content_val=PYSCENE_ADAPTIVE_MIN_CONTENT_VAL,
+            ),
+            show_progress=False,
+        )
+        if not scene_list:
+            raise RuntimeError("AdaptiveDetector khong tim thay canh nao.")
+
+        ranges = [
+            (float(start_time.get_seconds()), float(end_time.get_seconds()))
+            for start_time, end_time in scene_list
+        ]
+        return self.export_ranges(
+            file_path,
+            output_dir,
+            ranges,
+            "Khong cat duoc canh {index} bang AdaptiveDetector.",
+        )
+
+    def split_video_by_adaptive_ffmpeg(self, file_path, output_dir):
+        scene_list = detect(
+            file_path,
+            AdaptiveDetector(
+                adaptive_threshold=PYSCENE_ADAPTIVE_THRESHOLD,
+                min_scene_len=PYSCENE_MIN_SCENE_LEN_FRAMES,
+                window_width=PYSCENE_ADAPTIVE_WINDOW_WIDTH,
+                min_content_val=PYSCENE_ADAPTIVE_MIN_CONTENT_VAL,
+            ),
+            show_progress=False,
+        )
+        if not scene_list:
+            raise RuntimeError("AdaptiveDetector khong tim thay canh nao.")
 
         stem, ext = os.path.splitext(os.path.basename(file_path))
         safe_stem = sanitize_filename(stem)
         created_files = []
 
-        for index, (start, end) in enumerate(ranges, start=1):
-            trimmed_end = max(start, end - AUTO_END_TRIM_SECONDS)
-            if trimmed_end - start < 0.1:
-                continue
-
-            output_name = f"{safe_stem}_{index}{ext}"
-            output_path = ensure_unique_filepath(os.path.join(output_dir, output_name))
-            result = run_command(
-                [
-                    FFMPEG_BIN,
-                    "-y",
-                    "-hide_banner",
-                    "-ss",
-                    f"{start:.3f}",
-                    "-to",
-                    f"{trimmed_end:.3f}",
-                    "-i",
-                    file_path,
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "0:a?",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "18",
-                    "-c:a",
-                    "aac",
-                    output_path,
-                ]
+        with tempfile.TemporaryDirectory(prefix="split_scene_", dir=output_dir) as temp_dir:
+            split_result = split_video_ffmpeg(
+                file_path,
+                scene_list,
+                output_dir=Path(temp_dir),
+                output_file_template="$VIDEO_NAME-Scene-$SCENE_NUMBER.mp4",
+                arg_override="-map 0:v:0 -map 0:a? -c:v libx264 -preset veryfast -crf 18 -c:a aac",
+                show_progress=False,
+                show_output=False,
             )
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or f"Khong cat duoc doan {index}.")
-            created_files.append(output_path)
+            if split_result != 0:
+                raise RuntimeError("split_video_ffmpeg khong xuat duoc video.")
+
+            temp_files = sorted(Path(temp_dir).glob("*-Scene-*.mp4"))
+            if not temp_files:
+                raise RuntimeError("Khong tim thay file tam do split_video_ffmpeg tao ra.")
+
+            for index, temp_file in enumerate(temp_files, start=1):
+                output_name = f"{safe_stem}_{index}{ext}"
+                output_path = ensure_unique_filepath(os.path.join(output_dir, output_name))
+                shutil.move(str(temp_file), output_path)
+                created_files.append(output_path)
 
         if not created_files:
-            raise RuntimeError("Tat ca doan sau khi trim 0.2 giay deu qua ngan.")
+            raise RuntimeError("split_video_ffmpeg da cat nhung khong xuat duoc file nao.")
 
         return created_files
+
+    def split_video_by_pyscenedetect(self, file_path, output_dir):
+        scene_list = detect(
+            file_path,
+            ContentDetector(
+                threshold=PYSCENE_THRESHOLD,
+                min_scene_len=PYSCENE_MIN_SCENE_LEN_FRAMES,
+            ),
+            show_progress=False,
+        )
+        if not scene_list:
+            raise RuntimeError("PySceneDetect khong tim thay canh nao.")
+        ranges = [
+            (float(start_time.get_seconds()), float(end_time.get_seconds()))
+            for start_time, end_time in scene_list
+        ]
+        return self.export_ranges(
+            file_path,
+            output_dir,
+            ranges,
+            "Khong cat duoc canh {index} bang PySceneDetect.",
+        )
 
     def list_videos_in_folder(self, folder_path):
         return sorted(
@@ -327,7 +533,7 @@ class SceneSplitTab:
 
         def task():
             total_segments = 0
-            self.append_log(f"Bat dau split {len(video_files)} video...")
+            self.append_log(f"Bat dau split {len(video_files)} video... Che do: AI (TransNetV2)")
             for index, file_path in enumerate(video_files, start=1):
                 file_name = os.path.basename(file_path)
                 self.append_log(f"[{index}/{len(video_files)}] Dang phan tich {file_name}")

@@ -1,3 +1,4 @@
+import html
 import os
 import re
 import threading
@@ -161,26 +162,160 @@ class TikTokDownloadTab:
                     video_urls.append(video_url)
             return video_urls
 
+    def format_view_count(self, view_count):
+        try:
+            count = int(view_count or 0)
+        except (TypeError, ValueError):
+            return "0"
+
+        if count >= 1_000_000_000:
+            value = count / 1_000_000_000
+            suffix = "B"
+        elif count >= 1_000_000:
+            value = count / 1_000_000
+            suffix = "M"
+        elif count >= 1_000:
+            value = count / 1_000
+            suffix = "K"
+        else:
+            return str(count)
+
+        if value >= 10 or value.is_integer():
+            return f"{int(value)}{suffix}"
+        return f"{value:.1f}{suffix}"
+
+    def build_download_file_path(self, video_url):
+        try:
+            info = self.get_video_info(video_url)
+            title = info.get("title", "tiktok_video")
+            view_count = info.get("view_count", 0)
+
+            safe_title = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).rstrip()
+            formatted_views = self.format_view_count(view_count)
+            file_name = sanitize_filename(f"{formatted_views}_{safe_title}") + ".mp4"
+        except Exception as exc:
+            self.append_log(f"yt_dlp loi, dung ten mac dinh: {exc}")
+            file_name = "tiktok_video.mp4"
+
+        return ensure_unique_filepath(os.path.join(self.download_dir, file_name))
+
+    def get_video_info(self, video_url):
+        with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+            return ydl.extract_info(video_url, download=False)
+
+    def download_stream_to_file(self, download_link, file_path, video_key):
+        self.append_log(f"Bat dau tai: {os.path.basename(file_path)}")
+
+        with requests.get(download_link, stream=True, timeout=120) as response, open(file_path, "wb") as file_obj:
+            response.raise_for_status()
+            total_size = int(response.headers.get("content-length", 0))
+            downloaded_size = 0
+            last_update = 0
+
+            for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+
+                file_obj.write(chunk)
+                downloaded_size += len(chunk)
+
+                now = time.time()
+                if now - last_update >= 0.2:
+                    downloaded_mb = downloaded_size / (1024 * 1024)
+                    if total_size > 0:
+                        total_mb = total_size / (1024 * 1024)
+                        percent = downloaded_size / total_size
+                        self.update_video_progress(
+                            video_key,
+                            percent,
+                            f"{downloaded_mb:.2f} / {total_mb:.2f} MB ({percent * 100:.1f}%)",
+                        )
+                    else:
+                        self.update_video_progress(video_key, 0, f"{downloaded_mb:.2f} MB / ?")
+                    last_update = now
+
+    def parse_snaptik_hd_link(self, html_text):
+        cleaned_html = html.unescape(html_text or "")
+        match = re.search(
+            r'<a[^>]+href="([^"]+)"[^>]*>\s*(?:<i[^>]*></i>)?\s*Download\s+MP4\s+HD\s*</a>',
+            cleaned_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return match.group(1)
+
+        fallback = re.search(
+            r'<a[^>]+href="([^"]+)"[^>]*>\s*(?:<i[^>]*></i>)?\s*Download\s+MP4',
+            cleaned_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if fallback:
+            return fallback.group(1)
+
+        return None
+
+    def request_snaptik_download_link(self, video_url):
+        endpoint = "https://snaptik.biz/api/ajaxSearch"
+        headers = {
+            "accept": "application/json, text/javascript, */*; q=0.01",
+            "origin": "https://snaptik.biz",
+            "referer": "https://snaptik.biz/en",
+            "x-requested-with": "XMLHttpRequest",
+        }
+        payloads = [
+            {"url": video_url},
+            {"q": video_url},
+            {"query": video_url},
+            {"url": video_url, "lang": "en"},
+            {"q": video_url, "lang": "en"},
+        ]
+
+        last_error = None
+        for payload in payloads:
+            try:
+                response = requests.post(endpoint, headers=headers, data=payload, timeout=60)
+                response.raise_for_status()
+                data = response.json()
+                if data.get("status") != "ok":
+                    last_error = data.get("msg") or data.get("message") or "SnapTik tra ve trang thai khong hop le."
+                    continue
+
+                download_link = self.parse_snaptik_hd_link(data.get("data", ""))
+                if download_link:
+                    return download_link
+                last_error = "Khong tim thay link Download MP4 HD trong response SnapTik."
+            except Exception as exc:
+                last_error = str(exc)
+
+        raise RuntimeError(last_error or "Khong lay duoc link tai tu SnapTik.")
+
+    def download_by_snaptik(self, video_url):
+        video_key = None
+        try:
+            self.append_log(f"Thu tai bang SnapTik: {video_url}")
+
+            file_path = self.build_download_file_path(video_url)
+            video_key = file_path
+            self.create_video_progress(video_key, f"Tai (SnapTik): {os.path.basename(file_path)}")
+
+            download_link = self.request_snaptik_download_link(video_url)
+            self.download_stream_to_file(download_link, file_path, video_key)
+
+            self.finish_video_progress(video_key, "Hoan tat")
+            self.append_log(f"Da tai xong bang SnapTik: {os.path.basename(file_path)}")
+            return True
+        except Exception:
+            if video_key:
+                self.fail_video_progress(video_key, "Tai that bai")
+            self.append_log(f"Loi SnapTik: {traceback.format_exc()}")
+            return False
+
     def download_tiktok_by_ttdownloader(self, video_url):
         video_key = None
         try:
             self.append_log(f"Dang xu ly: {video_url}")
 
-            try:
-                with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
-                    info = ydl.extract_info(video_url, download=False)
-                    title = info.get("title", "tiktok_video")
-                    view_count = info.get("view_count", 0)
-
-                safe_title = "".join(
-                    c for c in title if c.isalnum() or c in (" ", "_", "-")
-                ).rstrip()
-                file_name = sanitize_filename(f"{view_count}views_{safe_title}") + ".mp4"
-            except Exception as exc:
-                self.append_log(f"yt_dlp loi, dung ten mac dinh: {exc}")
-                file_name = "tiktok_video.mp4"
-
-            file_path = ensure_unique_filepath(os.path.join(self.download_dir, file_name))
+            file_path = self.build_download_file_path(video_url)
             video_key = file_path
             self.create_video_progress(video_key, f"Tai: {os.path.basename(file_path)}")
 
@@ -232,44 +367,25 @@ class TikTokDownloadTab:
             if not download_link:
                 self.append_log("Khong tim thay download_url trong response")
                 self.fail_video_progress(video_key, "Khong co download_url")
-                return
+                return False
 
-            self.append_log(f"Bat dau tai: {os.path.basename(file_path)}")
-
-            with requests.get(download_link, stream=True, timeout=120) as response, open(file_path, "wb") as file_obj:
-                response.raise_for_status()
-                total_size = int(response.headers.get("content-length", 0))
-                downloaded_size = 0
-                last_update = 0
-
-                for chunk in response.iter_content(chunk_size=8192):
-                    if not chunk:
-                        continue
-
-                    file_obj.write(chunk)
-                    downloaded_size += len(chunk)
-
-                    now = time.time()
-                    if now - last_update >= 0.2:
-                        downloaded_mb = downloaded_size / (1024 * 1024)
-                        if total_size > 0:
-                            total_mb = total_size / (1024 * 1024)
-                            percent = downloaded_size / total_size
-                            self.update_video_progress(
-                                video_key,
-                                percent,
-                                f"{downloaded_mb:.2f} / {total_mb:.2f} MB ({percent * 100:.1f}%)",
-                            )
-                        else:
-                            self.update_video_progress(video_key, 0, f"{downloaded_mb:.2f} MB / ?")
-                        last_update = now
+            self.download_stream_to_file(download_link, file_path, video_key)
 
             self.finish_video_progress(video_key, "Hoan tat")
             self.append_log(f"Da tai xong: {os.path.basename(file_path)}")
+            return True
         except Exception:
             if video_key:
                 self.fail_video_progress(video_key, "Tai that bai")
             self.append_log(f"Loi: {traceback.format_exc()}")
+            return False
+
+    def download_video_with_fallback(self, video_url):
+        if self.download_tiktok_by_ttdownloader(video_url):
+            return True
+
+        self.append_log("Thu fallback sang SnapTik...")
+        return self.download_by_snaptik(video_url)
 
     def start_download(self):
         url = self.link_entry.get().strip()
@@ -285,7 +401,7 @@ class TikTokDownloadTab:
                     if not self.is_valid_video_url(url):
                         self.append_log("Link khong dung dinh dang video TikTok.")
                         return
-                    self.download_tiktok_by_ttdownloader(url)
+                    self.download_video_with_fallback(url)
                 else:
                     if not self.is_valid_channel_url(url):
                         self.append_log("Link khong dung dinh dang channel TikTok.")
@@ -298,10 +414,9 @@ class TikTokDownloadTab:
                     self.append_log(f"Tim thay {len(video_urls)} video.")
                     for index, video_url in enumerate(video_urls, start=1):
                         self.append_log(f"Xu ly {index}/{len(video_urls)}")
-                        self.download_tiktok_by_ttdownloader(video_url)
+                        self.download_video_with_fallback(video_url)
                     self.append_log("Da tai xong tat ca video.")
             except Exception:
                 self.append_log(f"Loi chinh: {traceback.format_exc()}")
 
         threading.Thread(target=task, daemon=True).start()
-

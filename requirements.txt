@@ -1,0 +1,7 @@
+customtkinter
+requests
+yt-dlp
+playwright
+scenedetect[opencv]
+transnetv2-pytorch
+pyinstaller
