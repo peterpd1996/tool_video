@@ -160,7 +160,7 @@ class AutoCreateVideoTab:
         for index, video_url in enumerate(video_urls, start=1):
             try:
                 info = self.downloader.get_video_info(video_url)
-                view_count = int(info.get("view_count") or 0)
+                _, view_count = self.downloader.extract_title_and_view_count(info)
                 if self.searcher.is_ai_content(info):
                     self.append_log(f"[Loc {index}] Bo qua noi dung AI | {video_url}")
                     continue

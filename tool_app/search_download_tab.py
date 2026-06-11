@@ -41,11 +41,7 @@ class SearchDownloadTab:
         self.parent = parent
         self.downloader = downloader
         self.output_dir = os.getcwd()
-        self.cookie_value = (
-            "tt_chain_token=dpLh3IjcypWBPIVy+IochQ==; "
-            "tt_csrf_token=xZd1GZWF-LPmwNlyvS97LK-WHm-a69ZUAaoM; "
-            "ttwid=1%7CISDE1x4qMN3dX2scsRXf5otqyZidZEKtNUeWB1O1R4c%7C1775708968%7C331f088bdb6ac0292991d1959c3861baa6470e3371178052521f0bc40b8c3300"
-        )
+        self.tiktok_profile_dir = os.path.join(os.getcwd(), "tiktok_browser_profile")
 
         self._build_ui()
         self.append_log(f"Thu muc luu mac dinh: {self.output_dir}")
@@ -98,7 +94,15 @@ class SearchDownloadTab:
         self.output_entry.insert(0, self.output_dir)
         ctk.CTkButton(output_frame, text="Chon dich", command=self.choose_output_dir, width=120).pack(side="left")
 
-        ctk.CTkButton(self.parent, text="Tim va tai", command=self.start_search_download, width=220).pack(pady=8)
+        button_frame = ctk.CTkFrame(self.parent, fg_color="transparent")
+        button_frame.pack(pady=8)
+        ctk.CTkButton(
+            button_frame,
+            text="Dang nhap TikTok",
+            command=self.start_tiktok_login,
+            width=160,
+        ).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(button_frame, text="Tim va tai", command=self.start_search_download, width=180).pack(side="left")
 
         self.log_box = ctk.CTkTextbox(self.parent, height=360, width=860)
         self.log_box.pack(padx=20, pady=(10, 20), fill="both", expand=True)
@@ -128,44 +132,43 @@ class SearchDownloadTab:
     def get_search_label(self, keyword_or_url):
         return keyword_or_url.strip()
 
-    def parse_cookie_header(self, cookie_header):
-        cookies = []
-        for item in cookie_header.split(";"):
-            item = item.strip()
-            if not item or "=" not in item:
-                continue
-            name, value = item.split("=", 1)
-            cookies.append(
-                {
-                    "name": name.strip(),
-                    "value": value.strip(),
-                    "domain": ".tiktok.com",
-                    "path": "/",
-                }
-            )
-        return cookies
+    def create_browser_context(self, playwright, headless):
+        os.makedirs(self.tiktok_profile_dir, exist_ok=True)
+        return playwright.chromium.launch_persistent_context(
+            self.tiktok_profile_dir,
+            headless=headless,
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/136.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1440, "height": 1600},
+            locale="en-US",
+        )
+
+    def open_tiktok_login(self):
+        from playwright.sync_api import sync_playwright
+
+        self.append_log("Mo trinh duyet TikTok. Hay dang nhap xong roi dong cua so Chromium.")
+        with sync_playwright() as playwright:
+            context = self.create_browser_context(playwright, headless=False)
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto("https://www.tiktok.com/login", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_event("close", timeout=0)
+            context.close()
+        self.append_log("Da dong trinh duyet TikTok. Session da duoc luu vao profile local.")
+
+    def start_tiktok_login(self):
+        threading.Thread(target=self.open_tiktok_login, daemon=True).start()
 
     def fetch_search_page(self, keyword_or_url, target_count):
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         from playwright.sync_api import sync_playwright
 
         url = self.resolve_search_url(keyword_or_url)
-        cookie_header = self.cookie_value.strip()
-        if not cookie_header:
-            raise RuntimeError("Cookie TikTok dang rong trong config.")
 
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/136.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1440, "height": 1600},
-                locale="en-US",
-            )
-            context.add_cookies(self.parse_cookie_header(cookie_header))
+            context = self.create_browser_context(playwright, headless=True)
             page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
@@ -195,9 +198,19 @@ class SearchDownloadTab:
             page.wait_for_timeout(1500)
             html_text = page.content()
             final_url = page.url
+            page_title = page.title()
 
-            browser.close()
-            return html_text, final_url
+            context.close()
+            return html_text, final_url, page_title
+
+    def page_looks_like_generic_tiktok_shell(self, html_text, page_title):
+        title_value = (page_title or "").strip().lower()
+        html_lower = (html_text or "").lower()
+        return (
+            title_value == "tiktok - make your day"
+            and "/video/" not in html_lower
+            and "find '" not in title_value
+        )
 
     def extract_video_links_from_html(self, html_text, limit):
         href_pattern = re.compile(
@@ -254,7 +267,7 @@ class SearchDownloadTab:
         for index, video_url in enumerate(video_urls, start=1):
             try:
                 info = self.downloader.get_video_info(video_url)
-                view_count = int(info.get("view_count") or 0)
+                _, view_count = self.downloader.extract_title_and_view_count(info)
                 if self.is_ai_content(info):
                     self.append_log(f"[{index}] Bo qua vi nghi la noi dung AI | {video_url}")
                     continue
@@ -311,15 +324,22 @@ class SearchDownloadTab:
             f"Dang tim video cho chu de: {self.get_search_label(keyword)} | so luong: {limit} | min view: {min_view_count}"
         )
         try:
-            html_text, final_url = self.fetch_search_page(keyword, limit)
+            html_text, final_url, page_title = self.fetch_search_page(keyword, limit)
             self.append_log(f"Playwright da mo trang: {final_url}")
+            if self.page_looks_like_generic_tiktok_shell(html_text, page_title):
+                self.append_log(
+                    "TikTok dang tra ve trang chung thay vi ket qua tim kiem. Cookie/session hien tai co kha nang da het hieu luc hoac bi dua vao login gate."
+                )
+                return
             video_urls = self.extract_video_links_from_html(html_text, max(limit * 6, 30))
         except Exception as exc:
             self.append_log(f"Loi khi lay ket qua tim kiem: {exc}")
             return
 
         if not video_urls:
-            self.append_log("Khong tim thay link video nao tu trang search TikTok.")
+            self.append_log(
+                "Khong tim thay link video nao tu trang search TikTok. Kha nang cao TikTok da doi DOM hoac session hien tai khong duoc cap search result."
+            )
             return
 
         filtered_video_urls = self.filter_video_urls_by_views(video_urls, min_view_count, limit)

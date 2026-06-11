@@ -1,13 +1,26 @@
 import html
 import os
 import re
+import sys
 import threading
 import time
 import traceback
+from pathlib import Path
 from tkinter import filedialog
 
 import customtkinter as ctk
 import requests
+
+VENV_SITE_PACKAGES = (
+    Path(__file__).resolve().parents[1]
+    / "venv"
+    / "lib"
+    / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    / "site-packages"
+)
+if VENV_SITE_PACKAGES.exists() and str(VENV_SITE_PACKAGES) not in sys.path:
+    sys.path.append(str(VENV_SITE_PACKAGES))
+
 import yt_dlp
 
 from .helpers import append_textbox, ensure_unique_filepath, sanitize_filename
@@ -184,11 +197,49 @@ class TikTokDownloadTab:
             return f"{int(value)}{suffix}"
         return f"{value:.1f}{suffix}"
 
+    def parse_count_value(self, value):
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            cleaned = re.sub(r"[,\s]", "", value.strip())
+            if cleaned.isdigit():
+                return int(cleaned)
+        return 0
+
+    def extract_title_and_view_count(self, info):
+        info = info or {}
+        title_candidates = [
+            info.get("title"),
+            info.get("description"),
+            info.get("fulltitle"),
+            info.get("alt_title"),
+            info.get("id"),
+        ]
+        title = next((item for item in title_candidates if isinstance(item, str) and item.strip()), "tiktok_video")
+
+        stats = info.get("stats") if isinstance(info.get("stats"), dict) else {}
+        view_candidates = [
+            info.get("view_count"),
+            info.get("play_count"),
+            stats.get("viewCount"),
+            stats.get("playCount"),
+            stats.get("view_count"),
+            stats.get("play_count"),
+        ]
+        view_count = 0
+        for candidate in view_candidates:
+            view_count = self.parse_count_value(candidate)
+            if view_count > 0:
+                break
+
+        return title, view_count
+
     def build_download_file_path(self, video_url):
         try:
             info = self.get_video_info(video_url)
-            title = info.get("title", "tiktok_video")
-            view_count = info.get("view_count", 0)
+            title, view_count = self.extract_title_and_view_count(info)
 
             safe_title = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).rstrip()
             formatted_views = self.format_view_count(view_count)
