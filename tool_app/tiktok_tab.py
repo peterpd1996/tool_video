@@ -1,27 +1,13 @@
 import html
 import os
 import re
-import sys
 import threading
 import time
 import traceback
-from pathlib import Path
 from tkinter import filedialog
 
 import customtkinter as ctk
 import requests
-
-VENV_SITE_PACKAGES = (
-    Path(__file__).resolve().parents[1]
-    / "venv"
-    / "lib"
-    / f"python{sys.version_info.major}.{sys.version_info.minor}"
-    / "site-packages"
-)
-if VENV_SITE_PACKAGES.exists() and str(VENV_SITE_PACKAGES) not in sys.path:
-    sys.path.append(str(VENV_SITE_PACKAGES))
-
-import yt_dlp
 
 from .helpers import append_textbox, ensure_unique_filepath, sanitize_filename
 
@@ -156,24 +142,37 @@ class TikTokDownloadTab:
         self.app.after(0, _fail)
 
     def get_video_urls_from_channel(self, channel_url):
-        ydl_opts = {
-            "quiet": True,
-            "extract_flat": True,
-            "skip_download": True,
-            "force_generic_extractor": True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            result = ydl.extract_info(channel_url, download=False)
-            if "entries" not in result:
-                return []
-            video_urls = []
-            for entry in result["entries"]:
-                if "url" in entry:
-                    video_url = entry["url"]
-                    if not video_url.startswith("http"):
-                        video_url = f"https://www.tiktok.com{video_url}"
-                    video_urls.append(video_url)
-            return video_urls
+        match = re.match(r"https://www\.tiktok\.com/@([^/?#]+)", channel_url)
+        if not match:
+            return []
+        unique_id = match.group(1)
+
+        video_urls = []
+        cursor = 0
+        while True:
+            response = requests.get(
+                "https://www.tikwm.com/api/user/posts",
+                params={"unique_id": unique_id, "count": 30, "cursor": cursor},
+                headers={"accept": "application/json"},
+                timeout=60,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("code") != 0:
+                raise RuntimeError(payload.get("msg") or "tikwm khong tra ve danh sach video.")
+
+            data = payload.get("data") or {}
+            for video in data.get("videos") or []:
+                video_id = video.get("video_id")
+                if video_id:
+                    video_urls.append(f"https://www.tiktok.com/@{unique_id}/video/{video_id}")
+
+            if not data.get("hasMore"):
+                break
+            cursor = data.get("cursor") or 0
+            time.sleep(1)  # tikwm free gioi han ~1 request/giay
+
+        return video_urls
 
     def format_view_count(self, view_count):
         try:
@@ -245,14 +244,35 @@ class TikTokDownloadTab:
             formatted_views = self.format_view_count(view_count)
             file_name = sanitize_filename(f"{formatted_views}_{safe_title}") + ".mp4"
         except Exception as exc:
-            self.append_log(f"yt_dlp loi, dung ten mac dinh: {exc}")
+            self.append_log(f"Khong lay duoc thong tin video, dung ten mac dinh: {exc}")
             file_name = "tiktok_video.mp4"
 
         return ensure_unique_filepath(os.path.join(self.download_dir, file_name))
 
     def get_video_info(self, video_url):
-        with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
-            return ydl.extract_info(video_url, download=False)
+        response = requests.get(
+            "https://www.tikwm.com/api/",
+            params={"url": video_url},
+            headers={"accept": "application/json"},
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("code") != 0:
+            raise RuntimeError(payload.get("msg") or "tikwm khong tra ve du lieu video.")
+
+        data = payload.get("data") or {}
+        author = data.get("author") or {}
+        return {
+            "id": data.get("id"),
+            "title": data.get("title"),
+            "description": data.get("title"),
+            "view_count": data.get("play_count"),
+            "duration": data.get("duration"),
+            "uploader": author.get("nickname"),
+            "channel": author.get("unique_id"),
+            "tags": [],
+        }
 
     def download_stream_to_file(self, download_link, file_path, video_key):
         self.append_log(f"Bat dau tai: {os.path.basename(file_path)}")
