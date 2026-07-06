@@ -8,7 +8,7 @@ import requests
 
 from .helpers import append_textbox
 
-MIN_VIEW_COUNT = 200_000
+MIN_VIEW_COUNT = 500_000
 AI_KEYWORDS = [
     " ai ",
     "#ai",
@@ -82,7 +82,8 @@ class SearchDownloadTab:
         ctk.CTkLabel(min_view_frame, text="Min view", width=120, anchor="w").pack(side="left")
         self.min_view_entry = ctk.CTkEntry(min_view_frame, width=120)
         self.min_view_entry.pack(side="left")
-        self.min_view_entry.insert(0, str(MIN_VIEW_COUNT))
+        self.min_view_entry.insert(0, self.format_number_with_dots(MIN_VIEW_COUNT))
+        self.min_view_entry.bind("<KeyRelease>", self.auto_format_min_view_entry)
 
         max_duration_frame = ctk.CTkFrame(self.parent, fg_color="transparent")
         max_duration_frame.pack(fill="x", padx=20, pady=6)
@@ -109,6 +110,22 @@ class SearchDownloadTab:
 
     def append_log(self, text):
         append_textbox(self.app, self.log_box, text)
+
+    def format_number_with_dots(self, value):
+        return f"{int(value):,}".replace(",", ".")
+
+    def parse_entry_number(self, text, default=0):
+        digits = "".join(ch for ch in (text or "") if ch.isdigit())
+        return int(digits) if digits else default
+
+    def auto_format_min_view_entry(self, event=None):
+        text = self.min_view_entry.get()
+        digits = "".join(ch for ch in text if ch.isdigit())
+        formatted = self.format_number_with_dots(digits) if digits else ""
+        if formatted != text:
+            self.min_view_entry.delete(0, "end")
+            self.min_view_entry.insert(0, formatted)
+            self.min_view_entry.icursor("end")
 
     def set_entry_value(self, entry, value):
         entry.delete(0, "end")
@@ -237,11 +254,7 @@ class SearchDownloadTab:
             self.append_log("So luong video phai la so.")
             return
 
-        try:
-            min_view_count = int(self.min_view_entry.get().strip() or str(MIN_VIEW_COUNT))
-        except ValueError:
-            self.append_log("Min view phai la so.")
-            return
+        min_view_count = self.parse_entry_number(self.min_view_entry.get(), MIN_VIEW_COUNT)
 
         try:
             max_duration_seconds = int(self.max_duration_entry.get().strip() or "0")
@@ -257,10 +270,6 @@ class SearchDownloadTab:
             self.append_log("So luong video phai lon hon 0.")
             return
 
-        if min_view_count < 0:
-            self.append_log("Min view phai >= 0.")
-            return
-
         if not self.output_dir:
             self.append_log("Vui long chon thu muc dich.")
             return
@@ -269,7 +278,7 @@ class SearchDownloadTab:
 
         duration_label = f" | max giay: {max_duration_seconds}" if max_duration_seconds > 0 else ""
         self.append_log(
-            f"Dang tim video cho chu de: {self.get_search_label(keyword)} | so luong: {limit} | min view: {min_view_count}{duration_label}"
+            f"Dang tim video cho chu de: {self.get_search_label(keyword)} | so luong: {limit} | min view: {self.format_number_with_dots(min_view_count)}{duration_label}"
         )
         try:
             filtered_video_urls, scanned_count = self.search_and_filter_videos(
@@ -285,16 +294,16 @@ class SearchDownloadTab:
 
         self.append_log(f"Da quet {scanned_count} video ung vien.")
         if not filtered_video_urls:
-            self.append_log(f"Khong co video nao dat nguong >= {min_view_count} view.")
+            self.append_log(f"Khong co video nao dat nguong >= {self.format_number_with_dots(min_view_count)} view.")
             return
 
         if len(filtered_video_urls) < limit:
             self.append_log(
-                f"Chi tim duoc {len(filtered_video_urls)}/{limit} video dat nguong >= {min_view_count} view."
+                f"Chi tim duoc {len(filtered_video_urls)}/{limit} video dat nguong >= {self.format_number_with_dots(min_view_count)} view."
             )
         else:
             self.append_log(
-                f"Tim thay du {len(filtered_video_urls)} video dat nguong >= {min_view_count} view."
+                f"Tim thay du {len(filtered_video_urls)} video dat nguong >= {self.format_number_with_dots(min_view_count)} view."
             )
         previous_dir = self.downloader.download_dir
         self.downloader.download_dir = self.output_dir

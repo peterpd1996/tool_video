@@ -67,7 +67,7 @@ class AutoCreateVideoTab:
         ctk.CTkLabel(view_frame, text="Min view", width=120, anchor="w").pack(side="left")
         self.min_view_entry = ctk.CTkEntry(view_frame, width=120)
         self.min_view_entry.pack(side="left")
-        self.min_view_entry.insert(0, "200000")
+        self.min_view_entry.insert(0, "500000")
 
         output_frame = ctk.CTkFrame(self.parent, fg_color="transparent")
         output_frame.pack(fill="x", padx=20, pady=6)
@@ -206,7 +206,7 @@ class AutoCreateVideoTab:
 
             source_count = self.parse_positive_int(self.source_count_entry, 10, "Video nguon")
             output_count = self.parse_positive_int(self.output_count_entry, 5, "Video tao")
-            min_view_count = self.parse_positive_int(self.min_view_entry, 200000, "Min view")
+            min_view_count = self.parse_positive_int(self.min_view_entry, 500000, "Min view")
 
             if not self.splitter.has_ffmpeg_tools() or not self.merger.has_ffmpeg_tools():
                 self.append_log("Khong tim thay ffmpeg/ffprobe.")
