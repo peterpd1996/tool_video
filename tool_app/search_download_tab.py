@@ -124,11 +124,31 @@ class SearchDownloadTab:
     def get_search_label(self, keyword_or_url):
         return keyword_or_url.strip()
 
-    def search_tikwm_videos(self, keyword, need_count):
-        collected = []
+    def normalize_tikwm_video(self, video):
+        video_id = video.get("video_id")
+        author = video.get("author") or {}
+        unique_id = author.get("unique_id")
+        if not video_id or not unique_id:
+            return None
+        return {
+            "id": video_id,
+            "url": f"https://www.tiktok.com/@{unique_id}/video/{video_id}",
+            "title": video.get("title") or "",
+            "view_count": self.downloader.parse_count_value(video.get("play_count")),
+            "duration": self.downloader.parse_count_value(video.get("duration")),
+            "uploader": author.get("nickname") or "",
+            "channel": unique_id,
+        }
+
+    def search_and_filter_videos(
+        self, keyword, min_view_count, target_count, max_duration_seconds=0, max_candidates=200
+    ):
+        filtered_items = []
         seen_ids = set()
         cursor = 0
-        while len(collected) < need_count:
+        scanned_count = 0
+
+        while len(filtered_items) < target_count and scanned_count < max_candidates:
             response = requests.get(
                 "https://www.tikwm.com/api/feed/search",
                 params={"keywords": keyword, "count": 30, "cursor": cursor},
@@ -141,31 +161,32 @@ class SearchDownloadTab:
                 raise RuntimeError(payload.get("msg") or "tikwm khong tra ve ket qua tim kiem.")
 
             data = payload.get("data") or {}
-            videos = data.get("videos") or []
-            for video in videos:
-                video_id = video.get("video_id")
-                author = video.get("author") or {}
-                unique_id = author.get("unique_id")
-                if not video_id or not unique_id or video_id in seen_ids:
-                    continue
-                seen_ids.add(video_id)
-                collected.append(
-                    {
-                        "url": f"https://www.tiktok.com/@{unique_id}/video/{video_id}",
-                        "title": video.get("title") or "",
-                        "view_count": self.downloader.parse_count_value(video.get("play_count")),
-                        "duration": self.downloader.parse_count_value(video.get("duration")),
-                        "uploader": author.get("nickname") or "",
-                        "channel": unique_id,
-                    }
-                )
+            raw_videos = data.get("videos") or []
+            if not raw_videos:
+                break
 
-            if not videos or not data.get("hasMore"):
+            for raw_video in raw_videos:
+                video = self.normalize_tikwm_video(raw_video)
+                if not video or video["id"] in seen_ids:
+                    continue
+                seen_ids.add(video["id"])
+                scanned_count += 1
+
+                if self.video_passes_filters(video, scanned_count, min_view_count, max_duration_seconds):
+                    filtered_items.append((video["url"], video["view_count"]))
+                    if len(filtered_items) >= target_count:
+                        break
+                if scanned_count >= max_candidates:
+                    break
+
+            if len(filtered_items) >= target_count or scanned_count >= max_candidates:
+                break
+            if not data.get("hasMore"):
                 break
             cursor = data.get("cursor") or 0
             time.sleep(1)  # tikwm free gioi han ~1 request/giay
 
-        return collected
+        return filtered_items, scanned_count
 
     def is_ai_content(self, info):
         combined_parts = [
@@ -178,34 +199,29 @@ class SearchDownloadTab:
         combined_text = f" {' '.join(part for part in combined_parts if part)} ".lower()
         return any(keyword in combined_text for keyword in AI_KEYWORDS)
 
-    def filter_search_videos(self, videos, min_view_count, target_count, max_duration_seconds=0):
-        filtered_items = []
-        for index, video in enumerate(videos, start=1):
-            video_url = video["url"]
-            view_count = video["view_count"]
-            duration = video["duration"]
+    def video_passes_filters(self, video, index, min_view_count, max_duration_seconds):
+        video_url = video["url"]
+        view_count = video["view_count"]
+        duration = video["duration"]
 
-            if self.is_ai_content(video):
-                self.append_log(f"[{index}] Bo qua vi nghi la noi dung AI | {video_url}")
-                continue
-            if max_duration_seconds > 0 and duration >= max_duration_seconds:
-                self.append_log(
-                    f"[{index}] Bo qua vi dai {duration}s (can < {max_duration_seconds}s) | {video_url}"
-                )
-                continue
-            if view_count < min_view_count:
-                self.append_log(
-                    f"[{index}] Bo qua vi view thap: {self.downloader.format_view_count(view_count)} | {video_url}"
-                )
-                continue
-
-            filtered_items.append((video_url, view_count))
+        if self.is_ai_content(video):
+            self.append_log(f"[{index}] Bo qua vi nghi la noi dung AI | {video_url}")
+            return False
+        if max_duration_seconds > 0 and duration >= max_duration_seconds:
             self.append_log(
-                f"[{index}] Dat view: {self.downloader.format_view_count(view_count)} | {duration}s | {video_url}"
+                f"[{index}] Bo qua vi dai {duration}s (can < {max_duration_seconds}s) | {video_url}"
             )
-            if len(filtered_items) >= target_count:
-                break
-        return filtered_items
+            return False
+        if view_count < min_view_count:
+            self.append_log(
+                f"[{index}] Bo qua vi view thap: {self.downloader.format_view_count(view_count)} | {video_url}"
+            )
+            return False
+
+        self.append_log(
+            f"[{index}] Dat view: {self.downloader.format_view_count(view_count)} | {duration}s | {video_url}"
+        )
+        return True
 
     def search_and_download(self):
         keyword = self.keyword_entry.get().strip()
@@ -256,19 +272,18 @@ class SearchDownloadTab:
             f"Dang tim video cho chu de: {self.get_search_label(keyword)} | so luong: {limit} | min view: {min_view_count}{duration_label}"
         )
         try:
-            candidate_videos = self.search_tikwm_videos(keyword, max(limit * 6, 30))
+            filtered_video_urls, scanned_count = self.search_and_filter_videos(
+                keyword, min_view_count, limit, max_duration_seconds
+            )
         except Exception as exc:
             self.append_log(f"Loi khi lay ket qua tim kiem: {exc}")
             return
 
-        if not candidate_videos:
+        if scanned_count == 0:
             self.append_log("Khong tim thay video nao cho chu de nay.")
             return
 
-        self.append_log(f"Tim thay {len(candidate_videos)} video ung vien.")
-        filtered_video_urls = self.filter_search_videos(
-            candidate_videos, min_view_count, limit, max_duration_seconds
-        )
+        self.append_log(f"Da quet {scanned_count} video ung vien.")
         if not filtered_video_urls:
             self.append_log(f"Khong co video nao dat nguong >= {min_view_count} view.")
             return

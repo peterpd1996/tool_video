@@ -225,17 +225,15 @@ class AutoCreateVideoTab:
             self.append_log(f"Split: {split_dir}")
             self.append_log(f"Merged: {merge_dir}")
 
-            candidate_videos = self.searcher.search_tikwm_videos(keyword, max(source_count * 8, 40))
-            if not candidate_videos:
-                self.append_log("Khong tim thay video nao.")
-                return
-            self.append_log(f"Tim thay {len(candidate_videos)} video ung vien.")
-
-            selected_items = self.searcher.filter_search_videos(
-                candidate_videos,
+            selected_items, scanned_count = self.searcher.search_and_filter_videos(
+                keyword,
                 min_view_count,
                 source_count,
             )
+            if scanned_count == 0:
+                self.append_log("Khong tim thay video nao.")
+                return
+            self.append_log(f"Da quet {scanned_count} video ung vien.")
             if not selected_items:
                 self.append_log("Khong co video nao dat dieu kien loc.")
                 return
