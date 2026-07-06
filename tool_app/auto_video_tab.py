@@ -155,31 +155,6 @@ class AutoCreateVideoTab:
 
         return downloaded_files
 
-    def filter_candidate_urls(self, video_urls, min_view_count, target_count):
-        selected_items = []
-        for index, video_url in enumerate(video_urls, start=1):
-            try:
-                info = self.downloader.get_video_info(video_url)
-                _, view_count = self.downloader.extract_title_and_view_count(info)
-                if self.searcher.is_ai_content(info):
-                    self.append_log(f"[Loc {index}] Bo qua noi dung AI | {video_url}")
-                    continue
-                if view_count < min_view_count:
-                    self.append_log(
-                        f"[Loc {index}] Bo qua view thap: {self.downloader.format_view_count(view_count)} | {video_url}"
-                    )
-                    continue
-
-                selected_items.append((video_url, view_count))
-                self.append_log(
-                    f"[Loc {index}] Dat: {self.downloader.format_view_count(view_count)} | {video_url}"
-                )
-                if len(selected_items) >= target_count:
-                    break
-            except Exception as exc:
-                self.append_log(f"[Loc {index}] Khong doc duoc metadata, bo qua: {video_url} | {exc}")
-        return selected_items
-
     def split_downloaded_videos(self, video_files, split_dir):
         created_segments = []
         for index, file_path in enumerate(video_files, start=1):
@@ -250,15 +225,14 @@ class AutoCreateVideoTab:
             self.append_log(f"Split: {split_dir}")
             self.append_log(f"Merged: {merge_dir}")
 
-            html_text, final_url = self.searcher.fetch_search_page(keyword, source_count)
-            self.append_log(f"Da mo search TikTok: {final_url}")
-            candidate_urls = self.searcher.extract_video_links_from_html(html_text, max(source_count * 8, 40))
-            if not candidate_urls:
-                self.append_log("Khong tim thay link video nao.")
+            candidate_videos = self.searcher.search_tikwm_videos(keyword, max(source_count * 8, 40))
+            if not candidate_videos:
+                self.append_log("Khong tim thay video nao.")
                 return
+            self.append_log(f"Tim thay {len(candidate_videos)} video ung vien.")
 
-            selected_items = self.filter_candidate_urls(
-                candidate_urls,
+            selected_items = self.searcher.filter_search_videos(
+                candidate_videos,
                 min_view_count,
                 source_count,
             )

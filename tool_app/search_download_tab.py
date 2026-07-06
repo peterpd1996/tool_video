@@ -1,11 +1,10 @@
 import os
-import re
 import threading
 import time
 from tkinter import filedialog
-from urllib.parse import quote
 
 import customtkinter as ctk
+import requests
 
 from .helpers import append_textbox
 
@@ -41,7 +40,6 @@ class SearchDownloadTab:
         self.parent = parent
         self.downloader = downloader
         self.output_dir = os.getcwd()
-        self.tiktok_profile_dir = os.path.join(os.getcwd(), "tiktok_browser_profile")
 
         self._build_ui()
         self.append_log(f"Thu muc luu mac dinh: {self.output_dir}")
@@ -56,7 +54,7 @@ class SearchDownloadTab:
 
         note = ctk.CTkLabel(
             self.parent,
-            text="Nhap chu de can tim, so video can tai va view toi thieu. Tool se mo search TikTok, cuon lay them ket qua neu can, loc theo view roi tai ve.",
+            text="Nhap chu de can tim, so video can tai va view toi thieu. Tool se tim video qua API, loc theo view va thoi luong roi tai ve.",
             wraplength=820,
             justify="left",
         )
@@ -123,120 +121,51 @@ class SearchDownloadTab:
             self.set_entry_value(self.output_entry, selected)
             self.append_log(f"Thu muc dich: {selected}")
 
-    def build_search_url(self, keyword):
-        encoded_keyword = quote(keyword)
-        timestamp = int(time.time() * 1000)
-        return f"https://www.tiktok.com/search?q={encoded_keyword}&t={timestamp}"
-
-    def resolve_search_url(self, keyword_or_url):
-        return self.build_search_url(keyword_or_url.strip())
-
     def get_search_label(self, keyword_or_url):
         return keyword_or_url.strip()
 
-    def create_browser_context(self, playwright, headless):
-        os.makedirs(self.tiktok_profile_dir, exist_ok=True)
-        return playwright.chromium.launch_persistent_context(
-            self.tiktok_profile_dir,
-            headless=headless,
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/136.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1440, "height": 1600},
-            locale="en-US",
-        )
-
-    def fetch_search_page(self, keyword_or_url, target_count):
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.sync_api import sync_playwright
-
-        url = self.resolve_search_url(keyword_or_url)
-
-        with sync_playwright() as playwright:
-            context = self.create_browser_context(playwright, headless=True)
-            page = context.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-
-            try:
-                page.wait_for_selector('[id^="grid-item-container-"]', timeout=20000)
-            except PlaywrightTimeoutError:
-                self.append_log("Khong thay grid-item-container, se thu quet link video toan trang.")
-
-            candidate_target = max(target_count * 6, 30)
-            previous_count = 0
-            stable_rounds = 0
-            for _ in range(8):
-                page.wait_for_timeout(2000)
-                html_text = page.content()
-                current_count = len(self.extract_video_links_from_html(html_text, candidate_target))
-                if current_count >= candidate_target:
-                    break
-                if current_count <= previous_count:
-                    stable_rounds += 1
-                else:
-                    stable_rounds = 0
-                if stable_rounds >= 2:
-                    break
-                previous_count = current_count
-                page.mouse.wheel(0, 4000)
-
-            page.wait_for_timeout(1500)
-            html_text = page.content()
-            final_url = page.url
-            page_title = page.title()
-
-            context.close()
-            return html_text, final_url, page_title
-
-    def page_looks_like_generic_tiktok_shell(self, html_text, page_title):
-        title_value = (page_title or "").strip().lower()
-        html_lower = (html_text or "").lower()
-        return (
-            title_value == "tiktok - make your day"
-            and "/video/" not in html_lower
-            and "find '" not in title_value
-        )
-
-    # href co the la URL tuyet doi hoac tuong doi, va co the keo theo query param
-    VIDEO_HREF_PATTERN = re.compile(
-        r'href="(?:https://www\.tiktok\.com)?(/@[^"/]+/video/\d+)[^"]*"',
-        flags=re.IGNORECASE,
-    )
-
-    def extract_video_links_from_html(self, html_text, limit):
-        container_ids = [f"grid-item-container-{index}" for index in range(0, limit)]
-
-        found_links = []
-        seen_links = set()
-
-        def add_link(path):
-            video_url = f"https://www.tiktok.com{path}"
-            if video_url in seen_links:
-                return False
-            seen_links.add(video_url)
-            found_links.append(video_url)
-            return True
-
-        for container_id in container_ids:
-            anchor_pattern = re.compile(
-                rf'id="{re.escape(container_id)}".{{0,3000}}?href="(?:https://www\.tiktok\.com)?(/@[^"/]+/video/\d+)[^"]*"',
-                flags=re.IGNORECASE | re.DOTALL,
+    def search_tikwm_videos(self, keyword, need_count):
+        collected = []
+        seen_ids = set()
+        cursor = 0
+        while len(collected) < need_count:
+            response = requests.get(
+                "https://www.tikwm.com/api/feed/search",
+                params={"keywords": keyword, "count": 30, "cursor": cursor},
+                headers={"accept": "application/json"},
+                timeout=60,
             )
-            match = anchor_pattern.search(html_text)
-            if match:
-                add_link(match.group(1))
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("code") != 0:
+                raise RuntimeError(payload.get("msg") or "tikwm khong tra ve ket qua tim kiem.")
 
-        if found_links:
-            return found_links[:limit]
+            data = payload.get("data") or {}
+            videos = data.get("videos") or []
+            for video in videos:
+                video_id = video.get("video_id")
+                author = video.get("author") or {}
+                unique_id = author.get("unique_id")
+                if not video_id or not unique_id or video_id in seen_ids:
+                    continue
+                seen_ids.add(video_id)
+                collected.append(
+                    {
+                        "url": f"https://www.tiktok.com/@{unique_id}/video/{video_id}",
+                        "title": video.get("title") or "",
+                        "view_count": self.downloader.parse_count_value(video.get("play_count")),
+                        "duration": self.downloader.parse_count_value(video.get("duration")),
+                        "uploader": author.get("nickname") or "",
+                        "channel": unique_id,
+                    }
+                )
 
-        for href_match in self.VIDEO_HREF_PATTERN.finditer(html_text):
-            add_link(href_match.group(1))
-            if len(found_links) >= limit:
+            if not videos or not data.get("hasMore"):
                 break
+            cursor = data.get("cursor") or 0
+            time.sleep(1)  # tikwm free gioi han ~1 request/giay
 
-        return found_links
+        return collected
 
     def is_ai_content(self, info):
         combined_parts = [
@@ -249,37 +178,34 @@ class SearchDownloadTab:
         combined_text = f" {' '.join(part for part in combined_parts if part)} ".lower()
         return any(keyword in combined_text for keyword in AI_KEYWORDS)
 
-    def filter_video_urls_by_views(self, video_urls, min_view_count, target_count, max_duration_seconds=0):
-        filtered_urls = []
-        for index, video_url in enumerate(video_urls, start=1):
-            if index > 1:
-                time.sleep(1)  # tikwm free gioi han ~1 request/giay
-            try:
-                info = self.downloader.get_video_info(video_url)
-                _, view_count = self.downloader.extract_title_and_view_count(info)
-                if self.is_ai_content(info):
-                    self.append_log(f"[{index}] Bo qua vi nghi la noi dung AI | {video_url}")
-                    continue
-                duration = self.downloader.parse_count_value(info.get("duration"))
-                if max_duration_seconds > 0 and duration >= max_duration_seconds:
-                    self.append_log(
-                        f"[{index}] Bo qua vi dai {duration}s (can < {max_duration_seconds}s) | {video_url}"
-                    )
-                    continue
-                if view_count >= min_view_count:
-                    filtered_urls.append((video_url, view_count))
-                    self.append_log(
-                        f"[{index}] Dat view: {self.downloader.format_view_count(view_count)} | {video_url}"
-                    )
-                    if len(filtered_urls) >= target_count:
-                        break
-                else:
-                    self.append_log(
-                        f"[{index}] Bo qua vi view thap: {self.downloader.format_view_count(view_count)} | {video_url}"
-                    )
-            except Exception as exc:
-                self.append_log(f"[{index}] Khong doc duoc view, bo qua: {video_url} | {exc}")
-        return filtered_urls
+    def filter_search_videos(self, videos, min_view_count, target_count, max_duration_seconds=0):
+        filtered_items = []
+        for index, video in enumerate(videos, start=1):
+            video_url = video["url"]
+            view_count = video["view_count"]
+            duration = video["duration"]
+
+            if self.is_ai_content(video):
+                self.append_log(f"[{index}] Bo qua vi nghi la noi dung AI | {video_url}")
+                continue
+            if max_duration_seconds > 0 and duration >= max_duration_seconds:
+                self.append_log(
+                    f"[{index}] Bo qua vi dai {duration}s (can < {max_duration_seconds}s) | {video_url}"
+                )
+                continue
+            if view_count < min_view_count:
+                self.append_log(
+                    f"[{index}] Bo qua vi view thap: {self.downloader.format_view_count(view_count)} | {video_url}"
+                )
+                continue
+
+            filtered_items.append((video_url, view_count))
+            self.append_log(
+                f"[{index}] Dat view: {self.downloader.format_view_count(view_count)} | {duration}s | {video_url}"
+            )
+            if len(filtered_items) >= target_count:
+                break
+        return filtered_items
 
     def search_and_download(self):
         keyword = self.keyword_entry.get().strip()
@@ -330,33 +256,18 @@ class SearchDownloadTab:
             f"Dang tim video cho chu de: {self.get_search_label(keyword)} | so luong: {limit} | min view: {min_view_count}{duration_label}"
         )
         try:
-            html_text, final_url, page_title = self.fetch_search_page(keyword, limit)
-            self.append_log(f"Playwright da mo trang: {final_url}")
-            if self.page_looks_like_generic_tiktok_shell(html_text, page_title):
-                self.append_log(
-                    "TikTok dang tra ve trang chung thay vi ket qua tim kiem. Cookie/session hien tai co kha nang da het hieu luc hoac bi dua vao login gate."
-                )
-                return
-            video_urls = self.extract_video_links_from_html(html_text, max(limit * 6, 30))
+            candidate_videos = self.search_tikwm_videos(keyword, max(limit * 6, 30))
         except Exception as exc:
             self.append_log(f"Loi khi lay ket qua tim kiem: {exc}")
             return
 
-        if not video_urls:
-            debug_path = os.path.join(os.getcwd(), "tiktok_search_debug.html")
-            try:
-                with open(debug_path, "w", encoding="utf-8") as debug_file:
-                    debug_file.write(html_text)
-                self.append_log(f"Da luu HTML trang search vao: {debug_path}")
-            except OSError:
-                pass
-            self.append_log(
-                "Khong tim thay link video nao tu trang search TikTok. Kha nang cao TikTok da doi DOM hoac session hien tai khong duoc cap search result."
-            )
+        if not candidate_videos:
+            self.append_log("Khong tim thay video nao cho chu de nay.")
             return
 
-        filtered_video_urls = self.filter_video_urls_by_views(
-            video_urls, min_view_count, limit, max_duration_seconds
+        self.append_log(f"Tim thay {len(candidate_videos)} video ung vien.")
+        filtered_video_urls = self.filter_search_videos(
+            candidate_videos, min_view_count, limit, max_duration_seconds
         )
         if not filtered_video_urls:
             self.append_log(f"Khong co video nao dat nguong >= {min_view_count} view.")
